@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MediCareHub - highly available, self-healing web app (Reliability Pillar).
+  VPC across 2 AZs, ALB, Auto Scaling group, shared EFS, Multi-AZ RDS MySQL,
+  and optional Route 53 DNS failover to an S3 maintenance site.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: medicarehub
+    AllowedPattern: "^[a-z0-9-]+$"
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AppSourceUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/ankaan-33/aws-reliability-medicarehub/main/app/index.html
+    Description: URL of the app's index.html. Instances fall back to a built-in page if it can't be fetched.
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DBName:
+    Type: String
+    Default: medicarehub
+  DBUsername:
+    Type: String
+    Default: admin
+    NoEcho: true
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional, for DNS failover. A domain in a Route 53 public hosted zone you own,
+      e.g. app.example.com. The S3 failover bucket is given this exact name, as S3 website hosting requires.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional. The Route 53 hosted zone ID for DomainName.
+
+Conditions:
+  EnableDnsFailover: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Mappings:
+  # S3 website endpoints and their Route 53 alias hosted zone IDs, by region.
+  # Add your region here if it's missing:
+  # https://docs.aws.amazon.com/general/latest/gr/s3.html#s3_website_region_endpoints
+  S3Website:
+    us-east-1:      { Endpoint: s3-website-us-east-1.amazonaws.com,      ZoneId: Z3AQBSTGFYJSTF }
+    us-east-2:      { Endpoint: s3-website.us-east-2.amazonaws.com,      ZoneId: Z2O1EMRO9K5GLX }
+    us-west-2:      { Endpoint: s3-website-us-west-2.amazonaws.com,      ZoneId: Z3BJ6K6RIION7M }
+    eu-west-1:      { Endpoint: s3-website-eu-west-1.amazonaws.com,      ZoneId: Z1BKCTXD74EZPE }
+    eu-west-2:      { Endpoint: s3-website.eu-west-2.amazonaws.com,      ZoneId: Z3GKZC51ZF0DB4 }
+    eu-central-1:   { Endpoint: s3-website.eu-central-1.amazonaws.com,   ZoneId: Z21DNDUVLTQW6Q }
+    ap-southeast-2: { Endpoint: s3-website-ap-southeast-2.amazonaws.com, ZoneId: Z1WCIGYICN2BYD }
+
+Resources:
+  # ================================================================ Network
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+  DBSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-a" }]
+  DBSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.10.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  # DB subnets keep the VPC's main route table: local traffic only, no internet route.
+
+  # ================================================================ Security groups (layered)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web servers - HTTP only from the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSecurityGroup }
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NFS only from the web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 2049, ToPort: 2049, SourceSecurityGroupId: !Ref AppSecurityGroup }
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL only from the web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSecurityGroup }
+
+  # ================================================================ Shared storage
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags: [{ Key: Name, Value: !Sub "${ProjectName}-shared" }]
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroups: [!Ref EFSSecurityGroup]
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroups: [!Ref EFSSecurityGroup]
+
+  # ================================================================ Compute
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore      # Session Manager instead of SSH
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y httpd amazon-efs-utils
+
+            # Instance identity via IMDSv2
+            TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            md() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+            INSTANCE_ID=$(md instance-id)
+            AZ=$(md placement/availability-zone)
+
+            # Shared storage: mount EFS (TLS) at /var/www/html/uploads and persist across reboots
+            mkdir -p /var/www/html/uploads
+            echo "${FileSystem}:/ /var/www/html/uploads efs _netdev,tls 0 0" >> /etc/fstab
+            for i in $(seq 1 10); do mount -a && break; sleep 10; done
+            echo "$(date -u +%FT%TZ) $INSTANCE_ID booted in $AZ" >> /var/www/html/uploads/instances.log
+
+            # App: fetch the page from the repo, fall back to a built-in page
+            if ! curl -fsSL "${AppSourceUrl}" -o /var/www/html/index.html; then
+              echo '<h1>MediCareHub</h1><p>Served by {{INSTANCE_ID}} in {{AZ}}</p>' > /var/www/html/index.html
+            fi
+            sed -i "s/{{INSTANCE_ID}}/$INSTANCE_ID/g; s/{{AZ}}/$AZ/g" /var/www/html/index.html
+            echo OK > /var/www/html/health.html
+
+            systemctl enable --now httpd
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [MountTargetA, MountTargetB, DefaultRoute]
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB                  # replace instances the ALB marks unhealthy, not just failed ones
+      HealthCheckGracePeriod: 180
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # ================================================================ Load balancing
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-tg"
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health.html
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ================================================================ Database (Multi-AZ)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for MediCareHub RDS
+      SubnetIds: [!Ref DBSubnetA, !Ref DBSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete                  # demo stack; use Snapshot for real data
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: true                          # synchronous standby in the second AZ, automatic failover
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true         # password generated and stored in Secrets Manager
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # ================================================================ DNS failover (optional)
+  FailoverBucket:
+    Type: AWS::S3::Bucket
+    Condition: EnableDnsFailover
+    Properties:
+      BucketName: !Ref DomainName            # must equal the domain for S3 website hosting via Route 53
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  FailoverBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: EnableDnsFailover
+    Properties:
+      Bucket: !Ref FailoverBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadMaintenancePage
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${FailoverBucket.Arn}/*"
+
+  ALBHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: EnableDnsFailover
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !GetAtt LoadBalancer.DNSName
+        Port: 80
+        ResourcePath: /health.html
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - { Key: Name, Value: !Sub "${ProjectName}-alb-health" }
+
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: EnableDnsFailover
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName                  # primary and secondary must share the same name
+      Type: A
+      SetIdentifier: primary-alb
+      Failover: PRIMARY
+      HealthCheckId: !Ref ALBHealthCheck
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: EnableDnsFailover
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      SetIdentifier: secondary-s3
+      Failover: SECONDARY
+      AliasTarget:
+        DNSName: !FindInMap [S3Website, !Ref "AWS::Region", Endpoint]
+        HostedZoneId: !FindInMap [S3Website, !Ref "AWS::Region", ZoneId]
+        EvaluateTargetHealth: false
+
+Outputs:
+  AppUrl:
+    Description: The app through the load balancer
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  SharedLogUrl:
+    Description: Boot log written by every instance to EFS
+    Value: !Sub "http://${LoadBalancer.DNSName}/uploads/instances.log"
+  DomainUrl:
+    Condition: EnableDnsFailover
+    Value: !Sub "http://${DomainName}"
+  FailoverBucketName:
+    Condition: EnableDnsFailover
+    Description: Upload app/maintenance.html here as index.html (scripts/deploy.sh does this)
+    Value: !Ref FailoverBucket
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: Secrets Manager secret holding the generated DB password
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
